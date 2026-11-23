@@ -1,0 +1,268 @@
+WITH date_range AS (
+  SELECT
+    DATE '2026-09-01' AS period1_start,
+    DATE '2026-10-01' AS period2_start,
+    DATE '2026-11-01' AS end_date
+),
+
+-- 1. ORDER DATA
+order_base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+    COALESCE(pb.name, 'NA') AS brand,
+    SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
+    SAFE_CAST(oi.sp AS NUMERIC) AS sp_num
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata') >= d.period1_start
+    AND DATE(oo.create_date, 'Asia/Kolkata') < d.end_date
+    AND LOWER(TRIM(nt.division)) = 'beauty'
+),
+
+order_metrics AS (
+  SELECT
+    brand,
+
+    SUM(IF(
+      order_date >= DATE '2026-09-01'
+      AND order_date < DATE '2026-10-01',
+      quantity, 0
+    )) AS p1_qty,
+
+    SUM(IF(
+      order_date >= DATE '2026-09-01'
+      AND order_date < DATE '2026-10-01',
+      sp_num * quantity, 0
+    )) AS p1_gmv,
+
+    SUM(IF(
+      order_date >= DATE '2026-10-01'
+      AND order_date < DATE '2026-11-01',
+      quantity, 0
+    )) AS p2_qty,
+
+    SUM(IF(
+      order_date >= DATE '2026-10-01'
+      AND order_date < DATE '2026-11-01',
+      sp_num * quantity, 0
+    )) AS p2_gmv
+
+  FROM order_base
+  GROUP BY brand
+),
+
+-- 2. PDP + ATC EVENTS
+all_events AS (
+  SELECT
+    'PDP' AS event_type,
+    LOWER(product_id) AS event_product_id,
+    create_date AS event_date
+  FROM `slikk-prod.slikksilver.silver_pdp_events`
+  CROSS JOIN date_range d
+  WHERE
+    create_date >= d.period1_start
+    AND create_date < d.end_date
+    AND product_id IS NOT NULL
+
+  UNION ALL
+
+  SELECT
+    'ATC' AS event_type,
+    LOWER(product_id) AS event_product_id,
+    create_date AS event_date
+  FROM `slikk-prod.slikksilver.silver_add_to_cart_events`
+  CROSS JOIN date_range d
+  WHERE
+    create_date >= d.period1_start
+    AND create_date < d.end_date
+    AND product_id IS NOT NULL
+),
+
+product_mapping AS (
+  SELECT
+    event_product_id,
+    product_id
+  FROM (
+    SELECT
+      e.event_product_id,
+      pp.id AS product_id,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.event_product_id
+        ORDER BY
+          CASE
+            WHEN e.event_product_id = LOWER(pp.skid) THEN 1
+            WHEN e.event_product_id = LOWER(pp.sku) THEN 2
+            WHEN e.event_product_id = LOWER(pp.barcode) THEN 3
+          END,
+          pp.id
+      ) AS rn
+
+    FROM (
+      SELECT DISTINCT event_product_id
+      FROM all_events
+    ) e
+
+    JOIN `slikk-prod.slikkprodpublic.product_product` pp
+      ON e.event_product_id = LOWER(pp.skid)
+      OR e.event_product_id = LOWER(pp.sku)
+      OR e.event_product_id = LOWER(pp.barcode)
+  )
+  WHERE rn = 1
+),
+
+mapped_events AS (
+  SELECT
+    e.event_type,
+    e.event_date,
+    pm.product_id
+  FROM all_events e
+  JOIN product_mapping pm
+    ON e.event_product_id = pm.event_product_id
+),
+
+-- 3. BRAND MAPPING FOR EVENTS
+event_product_data AS (
+  SELECT
+    COALESCE(pb.name, 'NA') AS brand,
+    me.event_type,
+    me.event_date
+
+  FROM mapped_events me
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = me.product_id
+
+  JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  WHERE LOWER(TRIM(nt.division)) = 'beauty'
+),
+
+event_metrics AS (
+  SELECT
+    brand,
+
+    COUNTIF(
+      event_type = 'PDP'
+      AND event_date >= DATE '2026-09-01'
+      AND event_date < DATE '2026-10-01'
+    ) AS p1_pdp,
+
+    COUNTIF(
+      event_type = 'ATC'
+      AND event_date >= DATE '2026-09-01'
+      AND event_date < DATE '2026-10-01'
+    ) AS p1_atc,
+
+    COUNTIF(
+      event_type = 'PDP'
+      AND event_date >= DATE '2026-10-01'
+      AND event_date < DATE '2026-11-01'
+    ) AS p2_pdp,
+
+    COUNTIF(
+      event_type = 'ATC'
+      AND event_date >= DATE '2026-10-01'
+      AND event_date < DATE '2026-11-01'
+    ) AS p2_atc
+
+  FROM event_product_data
+  GROUP BY brand
+),
+
+-- 4. COMBINE ORDER + EVENT METRICS
+all_brands AS (
+  SELECT brand
+  FROM order_metrics
+
+  UNION DISTINCT
+
+  SELECT brand
+  FROM event_metrics
+),
+
+combined AS (
+  SELECT
+    a.brand,
+
+    COALESCE(o.p1_gmv, 0) AS p1_gmv,
+    COALESCE(o.p1_qty, 0) AS p1_qty,
+    COALESCE(e.p1_pdp, 0) AS p1_pdp,
+    COALESCE(e.p1_atc, 0) AS p1_atc,
+
+    COALESCE(o.p2_gmv, 0) AS p2_gmv,
+    COALESCE(o.p2_qty, 0) AS p2_qty,
+    COALESCE(e.p2_pdp, 0) AS p2_pdp,
+    COALESCE(e.p2_atc, 0) AS p2_atc
+
+  FROM all_brands a
+
+  LEFT JOIN order_metrics o
+    ON a.brand = o.brand
+
+  LEFT JOIN event_metrics e
+    ON a.brand = e.brand
+)
+
+-- 5. FINAL BRAND-WISE OUTPUT
+SELECT
+  brand,
+
+  -- September 2026
+  ROUND(p1_gmv, 2) AS period1_gmv,
+  p1_qty AS period1_qty,
+  ROUND(SAFE_DIVIDE(p1_gmv, p1_qty), 2) AS period1_asp,
+  p1_pdp AS period1_pdp,
+  p1_atc AS period1_atc,
+
+  ROUND(
+    SAFE_DIVIDE(p1_atc, p1_pdp) * 100, 2
+  ) AS period1_pdp_to_atc,
+
+  ROUND(
+    SAFE_DIVIDE(p1_qty, p1_pdp) * 100, 2
+  ) AS period1_conv,
+
+  -- October 2026
+  ROUND(p2_gmv, 2) AS period2_gmv,
+  p2_qty AS period2_qty,
+  ROUND(SAFE_DIVIDE(p2_gmv, p2_qty), 2) AS period2_asp,
+  p2_pdp AS period2_pdp,
+  p2_atc AS period2_atc,
+
+  ROUND(
+    SAFE_DIVIDE(p2_atc, p2_pdp) * 100, 2
+  ) AS period2_pdp_to_atc,
+
+  ROUND(
+    SAFE_DIVIDE(p2_qty, p2_pdp) * 100, 2
+  ) AS period2_conv
+
+FROM combined
+
+ORDER BY period2_gmv DESC;
