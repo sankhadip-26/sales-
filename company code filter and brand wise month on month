@@ -1,0 +1,323 @@
+WITH date_range AS (
+  SELECT
+    DATE '2026-05-01' AS start_date,
+    DATE '2026-12-01' AS end_date
+),
+
+-- =====================================================
+-- 1. ORDER DATA
+-- =====================================================
+
+order_base AS (
+  SELECT
+    DATE(oo.create_date, 'Asia/Kolkata') AS order_date,
+    COALESCE(nt.division, 'NA') AS division,
+    COALESCE(pb.name, 'NA') AS brand,
+    SAFE_CAST(oi.quantity AS NUMERIC) AS quantity
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+
+  JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata') >= d.start_date
+    AND DATE(oo.create_date, 'Asia/Kolkata') < d.end_date
+    AND LOWER(TRIM(sc.code)) = 'ronak optik'
+),
+
+-- =====================================================
+-- 2. PDP EVENTS
+-- =====================================================
+
+all_events AS (
+  SELECT
+    LOWER(product_id) AS event_product_id,
+    create_date AS event_date
+
+  FROM `slikk-prod.slikksilver.silver_pdp_events`
+
+  CROSS JOIN date_range d
+
+  WHERE
+    create_date >= d.start_date
+    AND create_date < d.end_date
+    AND product_id IS NOT NULL
+),
+
+-- =====================================================
+-- 3. PRODUCT ID MAPPING
+-- Priority: SKID > SKU > BARCODE
+-- =====================================================
+
+product_mapping AS (
+  SELECT
+    event_product_id,
+    product_id
+
+  FROM (
+    SELECT
+      e.event_product_id,
+      pp.id AS product_id,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.event_product_id
+        ORDER BY
+          CASE
+            WHEN e.event_product_id = LOWER(pp.skid) THEN 1
+            WHEN e.event_product_id = LOWER(pp.sku) THEN 2
+            WHEN e.event_product_id = LOWER(pp.barcode) THEN 3
+          END,
+          pp.id
+      ) AS rn
+
+    FROM (
+      SELECT DISTINCT event_product_id
+      FROM all_events
+    ) e
+
+    JOIN `slikk-prod.slikkprodpublic.product_product` pp
+      ON e.event_product_id = LOWER(pp.skid)
+      OR e.event_product_id = LOWER(pp.sku)
+      OR e.event_product_id = LOWER(pp.barcode)
+  )
+
+  WHERE rn = 1
+),
+
+mapped_events AS (
+  SELECT
+    e.event_date,
+    pm.product_id
+
+  FROM all_events e
+
+  JOIN product_mapping pm
+    ON e.event_product_id = pm.event_product_id
+),
+
+-- =====================================================
+-- 4. PRODUCT TAXONOMY
+-- =====================================================
+
+tags AS (
+  SELECT
+    product_id,
+    ANY_VALUE(division) AS division
+
+  FROM `slikk-prod.slikkanalytics.silver_new_product_tags`
+
+  GROUP BY product_id
+),
+
+-- =====================================================
+-- 5. RONAK OPTIK PDP DATA AT DIVISION + BRAND LEVEL
+-- =====================================================
+
+event_product_data AS (
+  SELECT
+    COALESCE(t.division, 'NA') AS division,
+    COALESCE(pb.name, 'NA') AS brand,
+    me.event_date
+
+  FROM mapped_events me
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = me.product_id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+
+  LEFT JOIN tags t
+    ON t.product_id = pp.id
+
+  WHERE
+    LOWER(TRIM(sc.code)) = 'ronak optik'
+),
+
+-- =====================================================
+-- 6. MONTH-WISE ORDER METRICS
+-- =====================================================
+
+order_metrics AS (
+  SELECT
+    division,
+    brand,
+
+    SUM(IF(order_date >= DATE '2026-05-01'
+      AND order_date < DATE '2026-06-01', quantity, 0)) AS may_qty,
+
+    SUM(IF(order_date >= DATE '2026-06-01'
+      AND order_date < DATE '2026-07-01', quantity, 0)) AS june_qty,
+
+    SUM(IF(order_date >= DATE '2026-07-01'
+      AND order_date < DATE '2026-08-01', quantity, 0)) AS july_qty,
+
+    SUM(IF(order_date >= DATE '2026-08-01'
+      AND order_date < DATE '2026-09-01', quantity, 0)) AS august_qty,
+
+    SUM(IF(order_date >= DATE '2026-09-01'
+      AND order_date < DATE '2026-10-01', quantity, 0)) AS september_qty,
+
+    SUM(IF(order_date >= DATE '2026-10-01'
+      AND order_date < DATE '2026-11-01', quantity, 0)) AS october_qty,
+
+    SUM(IF(order_date >= DATE '2026-11-01'
+      AND order_date < DATE '2026-12-01', quantity, 0)) AS november_qty
+
+  FROM order_base
+  GROUP BY division, brand
+),
+
+-- =====================================================
+-- 7. MONTH-WISE PDP METRICS
+-- =====================================================
+
+pdp_metrics AS (
+  SELECT
+    division,
+    brand,
+
+    COUNTIF(event_date >= DATE '2026-05-01'
+      AND event_date < DATE '2026-06-01') AS may_pdp,
+
+    COUNTIF(event_date >= DATE '2026-06-01'
+      AND event_date < DATE '2026-07-01') AS june_pdp,
+
+    COUNTIF(event_date >= DATE '2026-07-01'
+      AND event_date < DATE '2026-08-01') AS july_pdp,
+
+    COUNTIF(event_date >= DATE '2026-08-01'
+      AND event_date < DATE '2026-09-01') AS august_pdp,
+
+    COUNTIF(event_date >= DATE '2026-09-01'
+      AND event_date < DATE '2026-10-01') AS september_pdp,
+
+    COUNTIF(event_date >= DATE '2026-10-01'
+      AND event_date < DATE '2026-11-01') AS october_pdp,
+
+    COUNTIF(event_date >= DATE '2026-11-01'
+      AND event_date < DATE '2026-12-01') AS november_pdp
+
+  FROM event_product_data
+  GROUP BY division, brand
+),
+
+-- =====================================================
+-- 8. COMBINE ORDER + PDP METRICS
+-- =====================================================
+
+all_dimensions AS (
+  SELECT division, brand
+  FROM order_metrics
+
+  UNION DISTINCT
+
+  SELECT division, brand
+  FROM pdp_metrics
+),
+
+combined AS (
+  SELECT
+    a.division,
+    a.brand,
+
+    COALESCE(o.may_qty, 0) AS may_qty,
+    COALESCE(p.may_pdp, 0) AS may_pdp,
+
+    COALESCE(o.june_qty, 0) AS june_qty,
+    COALESCE(p.june_pdp, 0) AS june_pdp,
+
+    COALESCE(o.july_qty, 0) AS july_qty,
+    COALESCE(p.july_pdp, 0) AS july_pdp,
+
+    COALESCE(o.august_qty, 0) AS august_qty,
+    COALESCE(p.august_pdp, 0) AS august_pdp,
+
+    COALESCE(o.september_qty, 0) AS september_qty,
+    COALESCE(p.september_pdp, 0) AS september_pdp,
+
+    COALESCE(o.october_qty, 0) AS october_qty,
+    COALESCE(p.october_pdp, 0) AS october_pdp,
+
+    COALESCE(o.november_qty, 0) AS november_qty,
+    COALESCE(p.november_pdp, 0) AS november_pdp
+
+  FROM all_dimensions a
+
+  LEFT JOIN order_metrics o
+    ON a.division = o.division
+    AND a.brand = o.brand
+
+  LEFT JOIN pdp_metrics p
+    ON a.division = p.division
+    AND a.brand = p.brand
+)
+
+-- =====================================================
+-- 9. FINAL OUTPUT
+-- =====================================================
+
+SELECT
+  division,
+  brand,
+
+  -- MAY 2026
+  may_qty,
+  may_pdp,
+  ROUND(SAFE_DIVIDE(may_qty, may_pdp) * 100, 2) AS may_conversion_rate,
+
+  -- JUNE 2026
+  june_qty,
+  june_pdp,
+  ROUND(SAFE_DIVIDE(june_qty, june_pdp) * 100, 2) AS june_conversion_rate,
+
+  -- JULY 2026
+  july_qty,
+  july_pdp,
+  ROUND(SAFE_DIVIDE(july_qty, july_pdp) * 100, 2) AS july_conversion_rate,
+
+  -- AUGUST 2026
+  august_qty,
+  august_pdp,
+  ROUND(SAFE_DIVIDE(august_qty, august_pdp) * 100, 2) AS august_conversion_rate,
+
+  -- SEPTEMBER 2026
+  september_qty,
+  september_pdp,
+  ROUND(SAFE_DIVIDE(september_qty, september_pdp) * 100, 2) AS september_conversion_rate,
+
+  -- OCTOBER 2026
+  october_qty,
+  october_pdp,
+  ROUND(SAFE_DIVIDE(october_qty, october_pdp) * 100, 2) AS october_conversion_rate,
+
+  -- NOVEMBER 2026
+  november_qty,
+  november_pdp,
+  ROUND(SAFE_DIVIDE(november_qty, november_pdp) * 100, 2) AS november_conversion_rate
+
+FROM combined
+
+ORDER BY
+  division,
+  brand;
